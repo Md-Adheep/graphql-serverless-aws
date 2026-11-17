@@ -21,3 +21,17 @@ variable "create_github_oidc_provider" {
   type        = bool
   default     = true
 }
+
+# Numeric IDs used by GitHub's "immutable subject" OIDC claim format.
+#   gh api repos/<owner>/<repo> --jq '{repo_id: .id, owner_id: .owner.id}'
+variable "github_owner_id" {
+  description = "Numeric GitHub user/org ID of the repository owner"
+  type        = string
+  default     = "232045433"
+}
+
+variable "github_repository_id" {
+  description = "Numeric GitHub repository ID"
+  type        = string
+  default     = "1461322559"
+}

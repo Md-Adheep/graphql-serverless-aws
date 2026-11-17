@@ -17,7 +17,7 @@ terraform {
   #   terraform init -backend-config="bucket=<TF_STATE_BUCKET>"
   backend "s3" {
     key          = "graphql-app/prod/terraform.tfstate"
-    region       = "us-east-1"
+    region       = "us-east-2"
     encrypt      = true
     use_lockfile = true
   }

@@ -33,7 +33,7 @@
 {
   "Effect": "Allow",
   "Action": "rds-db:connect",
-  "Resource": "arn:aws:rds-db:us-east-1:<account>:dbuser:prx-0abc123def456/app_admin"
+  "Resource": "arn:aws:rds-db:us-east-2:<account>:dbuser:prx-0abc123def456/app_admin"
 }
 ```
 

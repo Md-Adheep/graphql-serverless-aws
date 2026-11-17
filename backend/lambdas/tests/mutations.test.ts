@@ -16,7 +16,7 @@ describe('mutations handler', () => {
 
   beforeEach(() => {
     process.env.GRAPHQL_SERVER_URL = 'http://internal-alb.local/graphql';
-    process.env.INTERNAL_TOKEN_SECRET_ARN = 'arn:aws:secretsmanager:us-east-1:123:secret:token';
+    process.env.INTERNAL_TOKEN_SECRET_ARN = 'arn:aws:secretsmanager:us-east-2:123:secret:token';
     vi.stubGlobal('fetch', fetchMock);
   });
   afterEach(() => {

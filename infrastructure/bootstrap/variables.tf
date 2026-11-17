@@ -1,7 +1,7 @@
 variable "aws_region" {
   description = "Primary AWS region"
   type        = string
-  default     = "us-east-1"
+  default     = "us-east-2"
 }
 
 variable "project" {
@@ -14,4 +14,10 @@ variable "github_repository" {
   description = "GitHub repository allowed to deploy, as owner/name"
   type        = string
   default     = "Md-Adheep/graphql-serverless-aws"
+}
+
+variable "create_github_oidc_provider" {
+  description = "false = reuse the GitHub OIDC provider that already exists in this AWS account"
+  type        = bool
+  default     = true
 }

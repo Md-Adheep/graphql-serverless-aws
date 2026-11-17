@@ -11,7 +11,7 @@
 | Docker | any recent | Local development only (CI builds the image) |
 | GitHub repo | with Actions enabled | CI/CD |
 
-> **Cost while running** (us-east-1, defaults): NAT gateway ~$1.10/day, internal ALB ~$0.55/day,
+> **Cost while running** (us-east-2, defaults): NAT gateway ~$1.10/day, internal ALB ~$0.55/day,
 > RDS Proxy ~$0.72/day, Fargate 1 × 0.25 vCPU arm64 ~$0.25/day, RDS db.t4g.micro ~$0.40/day
 > (free tier eligible), plus cents for Lambda, AppSync, CloudFront, S3 and CloudWatch.
 > **About $3–4 per day.** Tear it down when you're finished (see the end of this page).
@@ -31,6 +31,14 @@ terraform apply -var="github_repository=Md-Adheep/graphql-serverless-aws"
 
 Note the two outputs: `tf_state_bucket` and `github_deploy_role_arn`.
 
+> **Existing AWS account?** If the account already has a GitHub OIDC provider (check:
+> `aws iam list-open-id-connect-providers`; look for `token.actions.githubusercontent.com`),
+> reuse it instead of creating a second one:
+> `terraform apply -var="create_github_oidc_provider=false"`
+>
+> **Region:** everything deploys to **us-east-2 (Ohio)** by default. Only the optional CloudFront
+> custom-domain certificate is created in us-east-1, because CloudFront requires that.
+
 ## Step 2: Configure the GitHub repository
 
 **Settings → Secrets and variables → Actions**
@@ -39,7 +47,7 @@ Note the two outputs: `tf_state_bucket` and `github_deploy_role_arn`.
 |---|---|---|
 | Variable | `AWS_DEPLOY_ROLE_ARN` | `github_deploy_role_arn` output |
 | Variable | `TF_STATE_BUCKET` | `tf_state_bucket` output |
-| Variable | `AWS_REGION` | `us-east-1` |
+| Variable | `AWS_REGION` | `us-east-2` |
 | Variable | `DOMAIN_NAME` | *(optional)* e.g. `tasks.example.com` |
 | Secret | `ALERT_EMAIL` | address that receives CloudWatch alarm emails |
 

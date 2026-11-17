@@ -41,7 +41,7 @@ provider:
   # straight to CloudFormation and works (configValidationMode: warn).
   runtime: nodejs22.x
   architecture: arm64           # Graviton: ~20% cheaper than x86 for the same performance
-  region: ${opt:region, 'us-east-1'}
+  region: ${opt:region, 'us-east-2'}
   stage: ${opt:stage, 'prod'}
   memorySize: 512
   timeout: 10

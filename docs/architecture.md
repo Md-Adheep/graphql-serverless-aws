@@ -12,7 +12,7 @@ flowchart LR
 
     s3[("S3 bucket (private)<br/>React build")]
 
-    subgraph REGION["AWS region us-east-1"]
+    subgraph REGION["AWS region us-east-2"]
         appsync["AWS AppSync<br/>GraphQL API · API key<br/>Query / Mutation / Subscription (WebSocket)"]
 
         subgraph VPC["VPC 10.20.0.0/16 (2 AZs)"]

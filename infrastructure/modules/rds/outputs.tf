@@ -23,7 +23,7 @@ output "proxy_endpoint" {
 }
 
 # rds-db:connect resources use the proxy's resource id, e.g.
-#   arn:aws:rds-db:us-east-1:123456789012:dbuser:prx-0abc123def456/app_admin
+#   arn:aws:rds-db:us-east-2:123456789012:dbuser:prx-0abc123def456/app_admin
 output "proxy_resource_id" {
   value = element(split(":", aws_db_proxy.this.arn), 6)
 }

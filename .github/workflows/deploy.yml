@@ -20,7 +20,7 @@ permissions:
   contents: read
 
 env:
-  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-2' }}
   STAGE: prod
   SSM_PREFIX: /graphql-app/prod
   NODE_VERSION: '22'
@@ -45,7 +45,7 @@ jobs:
       run:
         working-directory: infrastructure/environments/prod
     env:
-      TF_VAR_aws_region: ${{ vars.AWS_REGION || 'us-east-1' }}
+      TF_VAR_aws_region: ${{ vars.AWS_REGION || 'us-east-2' }}
       TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
       TF_VAR_domain_name: ${{ vars.DOMAIN_NAME }}
     steps:

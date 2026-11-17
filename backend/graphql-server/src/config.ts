@@ -35,7 +35,7 @@ export function loadConfig(env = process.env): Config {
 
   return {
     port: Number(env.PORT ?? 4000),
-    region: env.AWS_REGION ?? 'us-east-1',
+    region: env.AWS_REGION ?? 'us-east-2',
     internalToken,
     introspection: env.ENABLE_INTROSPECTION === 'true',
     db: {

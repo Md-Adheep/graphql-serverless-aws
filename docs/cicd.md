@@ -93,7 +93,7 @@ invalidation of `/` and `/index.html` only (cheap, because hashed assets never n
 |---|---|---|
 | `AWS_DEPLOY_ROLE_ARN` | variable | Role assumed with OIDC (`id-token: write`) |
 | `TF_STATE_BUCKET` | variable | Terraform backend |
-| `AWS_REGION` | variable | Defaults to `us-east-1` |
+| `AWS_REGION` | variable | Defaults to `us-east-2` |
 | `DOMAIN_NAME` | variable | Optional custom domain |
 | `ALERT_EMAIL` | **secret** | SNS alarm subscription |
 

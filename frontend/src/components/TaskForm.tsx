@@ -1,4 +1,5 @@
 import { useState, type FormEvent } from 'react';
+import { IconPlus } from './icons';
 
 interface Props {
   onCreate: (title: string, description: string) => Promise<void>;
@@ -23,23 +24,26 @@ export function TaskForm({ onCreate }: Props) {
   }
 
   return (
-    <form className="task-form" onSubmit={submit}>
-      <input
-        aria-label="Task title"
-        placeholder="What needs doing?"
-        value={title}
-        maxLength={200}
-        onChange={(e) => setTitle(e.target.value)}
-        required
-      />
-      <input
-        aria-label="Description"
-        placeholder="Details (optional)"
-        value={description}
-        maxLength={2000}
-        onChange={(e) => setDescription(e.target.value)}
-      />
-      <button type="submit" disabled={busy || !title.trim()}>
+    <form className="composer" onSubmit={submit}>
+      <div className="composer-fields">
+        <input
+          aria-label="Task title"
+          placeholder="What needs to be done?"
+          value={title}
+          maxLength={200}
+          onChange={(e) => setTitle(e.target.value)}
+          required
+        />
+        <input
+          aria-label="Description"
+          placeholder="Add details (optional)"
+          value={description}
+          maxLength={2000}
+          onChange={(e) => setDescription(e.target.value)}
+        />
+      </div>
+      <button type="submit" className="btn-primary" disabled={busy || !title.trim()}>
+        <IconPlus />
         {busy ? 'Adding…' : 'Add task'}
       </button>
     </form>

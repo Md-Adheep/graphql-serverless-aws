@@ -19,7 +19,7 @@
     "@types/node": "^22.20.5",
     "@types/pg": "^8.23.1",
     "esbuild": "^0.28.2",
-    "serverless": "^3.40.0",
+    "serverless": "^4.46.0",
     "serverless-appsync-plugin": "^2.13.0",
     "serverless-esbuild": "^1.57.3",
     "serverless-iam-roles-per-function": "^3.2.0",

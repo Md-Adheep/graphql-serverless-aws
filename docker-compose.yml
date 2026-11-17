@@ -1,0 +1,38 @@
+# Local development: PostgreSQL + the private GraphQL server.
+#   docker compose up --build
+#   curl -s localhost:4000/graphql -H 'content-type: application/json' \
+#        -H 'x-internal-token: local-dev-token' -d '{"query":"{ tasks { id title status } }"}'
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: appdb
+      POSTGRES_USER: app_admin
+      POSTGRES_PASSWORD: local-only-password
+    ports:
+      - "5432:5432"
+    volumes:
+      # Same SQL files the migrate Lambda applies in AWS
+      - ./database/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app_admin -d appdb"]
+      interval: 5s
+      retries: 10
+
+  graphql-server:
+    build: ./backend/graphql-server
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PORT: "4000"
+      DB_HOST: postgres
+      DB_NAME: appdb
+      DB_USER: app_admin
+      DB_AUTH_MODE: password
+      DB_PASSWORD: local-only-password
+      DB_SSL: "false"
+      INTERNAL_API_TOKEN: local-dev-token
+      ENABLE_INTROSPECTION: "true"
+    ports:
+      - "4000:4000"

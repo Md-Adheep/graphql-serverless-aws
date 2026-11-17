@@ -1,0 +1,352 @@
+# Serverless Framework v3 - AppSync GraphQL API + TypeScript resolver Lambdas.
+#
+# Network/database values (subnets, security group, RDS Proxy endpoint, secret ARNs, ...) are
+# created by Terraform and published to SSM Parameter Store under /graphql-app/<stage>/.
+# Nothing environment-specific or secret is hard-coded here.
+service: graphql-app-lambdas
+frameworkVersion: '3'
+configValidationMode: warn
+
+plugins:
+  - serverless-esbuild
+  - serverless-appsync-plugin
+  - serverless-iam-roles-per-function
+
+params:
+  default:
+    ssm: /graphql-app/${sls:stage}
+
+custom:
+  esbuild:
+    bundle: true
+    minify: true
+    sourcemap: true
+    target: node22
+    platform: node
+    loader:
+      '.sql': text
+  # Each function gets its OWN IAM role (least privilege) that also inherits the shared
+  # provider.iam statements below (X-Ray only).
+  serverless-iam-roles-per-function:
+    defaultInherit: true
+  # Lambda alarm thresholds (tune per environment)
+  alarms:
+    errorsThreshold: 5          # errors per 5 minutes
+    durationP95Ms: 3000         # p95 latency
+    invocationsSpike: 10000     # invocations per 5 minutes (abnormal traffic / runaway client)
+
+provider:
+  name: aws
+  # Serverless v3's config schema predates nodejs22.x and prints a warning; the value is passed
+  # straight to CloudFormation and works (configValidationMode: warn).
+  runtime: nodejs22.x
+  architecture: arm64           # Graviton: ~20% cheaper than x86 for the same performance
+  region: ${opt:region, 'us-east-1'}
+  stage: ${opt:stage, 'prod'}
+  memorySize: 512
+  timeout: 10
+  logRetentionInDays: 30
+  tracing:
+    lambda: true                # X-Ray traces across AppSync -> Lambda -> ALB
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - xray:PutTraceSegments
+            - xray:PutTelemetryRecords
+          Resource: '*'         # X-Ray does not support resource-level permissions
+  deploymentBucket:
+    blockPublicAccess: true
+    serverSideEncryption: AES256
+    maxPreviousDeploymentArtifacts: 10   # kept so `serverless rollback` has versions to restore
+  vpc:
+    securityGroupIds:
+      - ${ssm:${param:ssm}/lambda-sg-id}
+    subnetIds: ${ssm:${param:ssm}/private-subnet-ids}
+  environment:
+    NODE_OPTIONS: --enable-source-maps
+    STAGE: ${sls:stage}
+    LOG_LEVEL: info
+  tags:
+    Project: graphql-app
+    Environment: ${sls:stage}
+    ManagedBy: serverless
+  stackTags:
+    Project: graphql-app
+    Environment: ${sls:stage}
+    ManagedBy: serverless
+
+package:
+  individually: true
+
+functions:
+  # ---------------- Query resolvers: Lambda -> RDS Proxy (IAM auth) -> RDS ----------------
+  queries:
+    handler: src/handlers/queries.handler
+    description: AppSync Query resolvers - reads directly from RDS through RDS Proxy (IAM auth)
+    environment:
+      DB_HOST: ${ssm:${param:ssm}/db-proxy-endpoint}
+      DB_PORT: '5432'
+      DB_NAME: ${ssm:${param:ssm}/db-name}
+      DB_USER: ${ssm:${param:ssm}/db-username}
+      DB_AUTH_MODE: iam
+    iamRoleStatements:
+      - Effect: Allow
+        Action: rds-db:connect
+        Resource: arn:aws:rds-db:${aws:region}:${aws:accountId}:dbuser:${ssm:${param:ssm}/db-proxy-resource-id}/${ssm:${param:ssm}/db-username}
+
+  # ---------- Mutation resolvers: Lambda -> internal ALB -> private GraphQL server ----------
+  mutations:
+    handler: src/handlers/mutations.handler
+    description: AppSync Mutation resolvers - forwards writes to the private GraphQL server on ECS Fargate
+    environment:
+      GRAPHQL_SERVER_URL: ${ssm:${param:ssm}/graphql-server-url}
+      INTERNAL_TOKEN_SECRET_ARN: ${ssm:${param:ssm}/internal-token-secret-arn}
+    iamRoleStatements:
+      - Effect: Allow
+        Action: secretsmanager:GetSecretValue
+        Resource: ${ssm:${param:ssm}/internal-token-secret-arn}
+
+  # ----------- Subscription resolvers: validate/authorize at subscribe time -----------
+  subscriptions:
+    handler: src/handlers/subscriptions.handler
+    description: AppSync Subscription resolvers - validates subscription requests
+    memorySize: 256
+    iamRoleStatements: []
+
+  # ---------------- DB migrations (invoked by CI/CD after each deploy) ----------------
+  migrate:
+    handler: src/handlers/migrate.handler
+    description: Applies pending SQL migrations to RDS (invoked by GitHub Actions)
+    timeout: 120
+    environment:
+      DB_HOST: ${ssm:${param:ssm}/db-proxy-endpoint}
+      DB_PORT: '5432'
+      DB_NAME: ${ssm:${param:ssm}/db-name}
+      DB_USER: ${ssm:${param:ssm}/db-username}
+      DB_AUTH_MODE: iam
+    iamRoleStatements:
+      - Effect: Allow
+        Action: rds-db:connect
+        Resource: arn:aws:rds-db:${aws:region}:${aws:accountId}:dbuser:${ssm:${param:ssm}/db-proxy-resource-id}/${ssm:${param:ssm}/db-username}
+
+appSync:
+  name: graphql-app-${sls:stage}
+  schema: schema.graphql
+  xrayEnabled: true
+  authentication:
+    type: API_KEY
+  apiKeys:
+    - name: webClient
+      description: React frontend (public client key - rate limiting & identification, not a secret)
+      expiresAfter: 365d
+  logging:
+    level: ERROR
+    retentionInDays: 30
+  dataSources:
+    queriesLambda:
+      type: AWS_LAMBDA
+      config:
+        functionName: queries
+    mutationsLambda:
+      type: AWS_LAMBDA
+      config:
+        functionName: mutations
+    subscriptionsLambda:
+      type: AWS_LAMBDA
+      config:
+        functionName: subscriptions
+  # No request/response templates -> AppSync "direct Lambda resolvers"
+  resolvers:
+    Query.tasks:
+      kind: UNIT
+      dataSource: queriesLambda
+    Query.task:
+      kind: UNIT
+      dataSource: queriesLambda
+    Mutation.createTask:
+      kind: UNIT
+      dataSource: mutationsLambda
+    Mutation.updateTask:
+      kind: UNIT
+      dataSource: mutationsLambda
+    Mutation.deleteTask:
+      kind: UNIT
+      dataSource: mutationsLambda
+    Subscription.onTaskCreated:
+      kind: UNIT
+      dataSource: subscriptionsLambda
+    Subscription.onTaskUpdated:
+      kind: UNIT
+      dataSource: subscriptionsLambda
+    Subscription.onTaskDeleted:
+      kind: UNIT
+      dataSource: subscriptionsLambda
+
+resources:
+  Resources:
+    # ===================== CloudWatch Alarms (-> SNS topic created by Terraform) =====================
+    QueriesErrorsAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: ${self:service}-${sls:stage}-queries-errors
+        AlarmDescription: Query Lambda is throwing errors
+        Namespace: AWS/Lambda
+        MetricName: Errors
+        Dimensions: [{ Name: FunctionName, Value: !Ref QueriesLambdaFunction }]
+        Statistic: Sum
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: ${self:custom.alarms.errorsThreshold}
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: ['${ssm:${param:ssm}/alarm-topic-arn}']
+        OKActions: ['${ssm:${param:ssm}/alarm-topic-arn}']
+
+    MutationsErrorsAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: ${self:service}-${sls:stage}-mutations-errors
+        AlarmDescription: Mutation Lambda is throwing errors (check the private GraphQL server too)
+        Namespace: AWS/Lambda
+        MetricName: Errors
+        Dimensions: [{ Name: FunctionName, Value: !Ref MutationsLambdaFunction }]
+        Statistic: Sum
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: ${self:custom.alarms.errorsThreshold}
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: ['${ssm:${param:ssm}/alarm-topic-arn}']
+        OKActions: ['${ssm:${param:ssm}/alarm-topic-arn}']
+
+    SubscriptionsErrorsAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: ${self:service}-${sls:stage}-subscriptions-errors
+        AlarmDescription: Subscription Lambda is throwing errors
+        Namespace: AWS/Lambda
+        MetricName: Errors
+        Dimensions: [{ Name: FunctionName, Value: !Ref SubscriptionsLambdaFunction }]
+        Statistic: Sum
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: ${self:custom.alarms.errorsThreshold}
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: ['${ssm:${param:ssm}/alarm-topic-arn}']
+
+    MigrateErrorsAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: ${self:service}-${sls:stage}-migrate-errors
+        AlarmDescription: Database migration failed
+        Namespace: AWS/Lambda
+        MetricName: Errors
+        Dimensions: [{ Name: FunctionName, Value: !Ref MigrateLambdaFunction }]
+        Statistic: Sum
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: 1
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: ['${ssm:${param:ssm}/alarm-topic-arn}']
+
+    QueriesDurationAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: ${self:service}-${sls:stage}-queries-latency-p95
+        AlarmDescription: Query Lambda p95 latency is high
+        Namespace: AWS/Lambda
+        MetricName: Duration
+        Dimensions: [{ Name: FunctionName, Value: !Ref QueriesLambdaFunction }]
+        ExtendedStatistic: p95
+        Period: 300
+        EvaluationPeriods: 3
+        DatapointsToAlarm: 2
+        Threshold: ${self:custom.alarms.durationP95Ms}
+        ComparisonOperator: GreaterThanThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: ['${ssm:${param:ssm}/alarm-topic-arn}']
+
+    MutationsDurationAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: ${self:service}-${sls:stage}-mutations-latency-p95
+        AlarmDescription: Mutation Lambda p95 latency is high
+        Namespace: AWS/Lambda
+        MetricName: Duration
+        Dimensions: [{ Name: FunctionName, Value: !Ref MutationsLambdaFunction }]
+        ExtendedStatistic: p95
+        Period: 300
+        EvaluationPeriods: 3
+        DatapointsToAlarm: 2
+        Threshold: ${self:custom.alarms.durationP95Ms}
+        ComparisonOperator: GreaterThanThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: ['${ssm:${param:ssm}/alarm-topic-arn}']
+
+    LambdaThrottlesAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: ${self:service}-${sls:stage}-throttles
+        AlarmDescription: Lambda invocations are being throttled (concurrency limit reached)
+        Namespace: AWS/Lambda
+        MetricName: Throttles
+        Statistic: Sum
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: 1
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: ['${ssm:${param:ssm}/alarm-topic-arn}']
+
+    QueriesInvocationsSpikeAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: ${self:service}-${sls:stage}-queries-invocations-spike
+        AlarmDescription: Unusually high query traffic (possible abuse or runaway client)
+        Namespace: AWS/Lambda
+        MetricName: Invocations
+        Dimensions: [{ Name: FunctionName, Value: !Ref QueriesLambdaFunction }]
+        Statistic: Sum
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: ${self:custom.alarms.invocationsSpike}
+        ComparisonOperator: GreaterThanThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: ['${ssm:${param:ssm}/alarm-topic-arn}']
+
+    AppSync5xxAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: ${self:service}-${sls:stage}-appsync-5xx
+        AlarmDescription: AppSync API returning server errors
+        Namespace: AWS/AppSync
+        MetricName: 5XXError
+        Dimensions: [{ Name: GraphQLAPIId, Value: !GetAtt GraphQlApi.ApiId }]
+        Statistic: Sum
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: 5
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: ['${ssm:${param:ssm}/alarm-topic-arn}']
+
+    AppSyncLatencyAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: ${self:service}-${sls:stage}-appsync-latency-p95
+        AlarmDescription: AppSync p95 latency is high
+        Namespace: AWS/AppSync
+        MetricName: Latency
+        Dimensions: [{ Name: GraphQLAPIId, Value: !GetAtt GraphQlApi.ApiId }]
+        ExtendedStatistic: p95
+        Period: 300
+        EvaluationPeriods: 3
+        DatapointsToAlarm: 2
+        Threshold: 2000
+        ComparisonOperator: GreaterThanThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: ['${ssm:${param:ssm}/alarm-topic-arn}']

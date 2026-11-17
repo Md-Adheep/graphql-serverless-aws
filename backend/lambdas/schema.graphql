@@ -1,0 +1,55 @@
+# Public GraphQL schema served by AWS AppSync.
+# Each field is resolved by a TypeScript Lambda (see serverless.yml -> appSync.resolvers).
+
+enum TaskStatus {
+  TODO
+  IN_PROGRESS
+  DONE
+}
+
+type Task {
+  id: ID!
+  title: String!
+  description: String
+  status: TaskStatus!
+  createdAt: AWSDateTime!
+  updatedAt: AWSDateTime!
+}
+
+input CreateTaskInput {
+  title: String!
+  description: String
+  status: TaskStatus
+}
+
+input UpdateTaskInput {
+  title: String
+  description: String
+  status: TaskStatus
+}
+
+type Query {
+  "Resolved by the `queries` Lambda directly against RDS (via RDS Proxy)."
+  tasks(status: TaskStatus, limit: Int): [Task!]!
+  task(id: ID!): Task
+}
+
+type Mutation {
+  "Resolved by the `mutations` Lambda, which forwards to the private GraphQL server on Fargate."
+  createTask(input: CreateTaskInput!): Task!
+  updateTask(id: ID!, input: UpdateTaskInput!): Task!
+  deleteTask(id: ID!): Task
+}
+
+type Subscription {
+  "Real-time push over WebSockets, triggered automatically by the matching mutation."
+  onTaskCreated: Task @aws_subscribe(mutations: ["createTask"])
+  onTaskUpdated(id: ID): Task @aws_subscribe(mutations: ["updateTask"])
+  onTaskDeleted: Task @aws_subscribe(mutations: ["deleteTask"])
+}
+
+schema {
+  query: Query
+  mutation: Mutation
+  subscription: Subscription
+}

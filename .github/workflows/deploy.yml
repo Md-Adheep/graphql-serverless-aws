@@ -1,0 +1,290 @@
+# Production deployment pipeline.
+#
+#   CI (tests) ─▶ Infrastructure (Terraform, approval gate) ─▶ Build image (arm64) ─▶ Backend ─▶ Frontend
+#
+# AWS access uses GitHub OIDC -> short-lived STS credentials for an IAM role. There are NO AWS
+# access keys stored in GitHub. Each deploy job records the "last known good" version first and
+# rolls back automatically if any later step (deploy, migration, smoke test) fails.
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false # never cancel a deploy half-way
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  STAGE: prod
+  SSM_PREFIX: /graphql-app/prod
+  NODE_VERSION: '22'
+  TERRAFORM_VERSION: '1.17.2'
+
+jobs:
+  # ───────────────────────────── 1. Tests ─────────────────────────────
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  # ───────────────────────────── 2. Infrastructure ─────────────────────────────
+  infrastructure:
+    name: Terraform apply
+    needs: ci
+    runs-on: ubuntu-latest
+    # "production" environment: add required reviewers in repo settings for a manual approval gate.
+    environment: production
+    permissions:
+      id-token: write
+      contents: read
+    defaults:
+      run:
+        working-directory: infrastructure/environments/prod
+    env:
+      TF_VAR_aws_region: ${{ vars.AWS_REGION || 'us-east-1' }}
+      TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+      TF_VAR_domain_name: ${{ vars.DOMAIN_NAME }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+      - run: terraform init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+      - run: terraform plan -input=false -out=tfplan
+      # Terraform applies are transactional per resource; a failed apply leaves the last good
+      # state in S3 (versioned bucket) and the next run converges. No partial-rollback needed.
+      - run: terraform apply -input=false tfplan
+
+  # ───────────────────────────── 3. Build container image ─────────────────────────────
+  build-image:
+    name: Build & push GraphQL server image
+    needs: infrastructure
+    runs-on: ubuntu-24.04-arm # native arm64 build for Graviton Fargate tasks
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: false
+      - uses: aws-actions/amazon-ecr-login@v2
+      - name: Resolve image name (tag = git SHA, immutable)
+        id: meta
+        run: |
+          REPO=$(aws ssm get-parameter --name "$SSM_PREFIX/ecr-repository-url" --query Parameter.Value --output text)
+          echo "repo=${REPO}" >> "$GITHUB_OUTPUT"
+          echo "image=${REPO}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+      - name: Build and push (skipped if this SHA was already pushed - re-runs are idempotent)
+        run: |
+          REPO_NAME="${{ steps.meta.outputs.repo }}"; REPO_NAME="${REPO_NAME#*/}"
+          if aws ecr describe-images --repository-name "$REPO_NAME" --image-ids imageTag="$GITHUB_SHA" >/dev/null 2>&1; then
+            echo "Image already exists, skipping build"; exit 0
+          fi
+          docker build -t "${{ steps.meta.outputs.image }}" backend/graphql-server
+          docker push "${{ steps.meta.outputs.image }}"
+
+  # ───────────────────────────── 4. Backend ─────────────────────────────
+  deploy-backend:
+    name: Deploy backend (Lambda + AppSync + ECS)
+    needs: build-image
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: backend/lambdas/package-lock.json
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: false
+      - run: npm ci
+        working-directory: backend/lambdas
+
+      - name: Load deployment parameters from SSM
+        id: params
+        run: |
+          get() { aws ssm get-parameter --name "$SSM_PREFIX/$1" --query Parameter.Value --output text; }
+          {
+            echo "cluster=$(get ecs-cluster)"
+            echo "service=$(get ecs-service)"
+            echo "family=$(get ecs-task-family)"
+            echo "container=$(get ecs-container-name)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Record last known good versions (rollback targets)
+        id: previous
+        run: |
+          TD=$(aws ecs describe-services --cluster "${{ steps.params.outputs.cluster }}" \
+                 --services "${{ steps.params.outputs.service }}" \
+                 --query 'services[0].taskDefinition' --output text)
+          echo "task_definition=${TD}" >> "$GITHUB_OUTPUT"
+          echo "sls_timestamp=$(scripts/sls-latest-timestamp.sh)" >> "$GITHUB_OUTPUT"
+          echo "Previous ECS task definition: ${TD}"
+
+      # 4a. Lambdas + AppSync (CloudFormation rolls the stack back by itself if this step fails)
+      - name: Deploy Lambdas & AppSync (Serverless Framework)
+        id: sls
+        working-directory: backend/lambdas
+        run: npx serverless deploy --stage "$STAGE" --region "$AWS_REGION" --conceal
+
+      - name: Run database migrations
+        id: migrate
+        working-directory: backend/lambdas
+        run: |
+          npx serverless invoke -f migrate --stage "$STAGE" --region "$AWS_REGION" | tee migrate-out.json
+          if grep -q '"errorMessage"' migrate-out.json; then echo "Migration failed"; exit 1; fi
+
+      # 4b. Private GraphQL server on ECS Fargate
+      - name: Fetch current task definition
+        run: |
+          aws ecs describe-task-definition --task-definition "${{ steps.params.outputs.family }}" \
+            --query taskDefinition > task-definition.json
+
+      - name: Render task definition with the new image
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ steps.params.outputs.container }}
+          image: ${{ needs.build-image.outputs.image }}
+
+      - name: Deploy to ECS (rolling, waits for healthy tasks)
+        id: ecs
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          cluster: ${{ steps.params.outputs.cluster }}
+          service: ${{ steps.params.outputs.service }}
+          wait-for-service-stability: true
+          wait-for-minutes: 15
+
+      # The ECS deployment circuit breaker may already have rolled back to the old revision and
+      # reported "stable". Make sure the NEW revision is the one actually running.
+      - name: Verify ECS is running the new revision
+        run: |
+          RUNNING=$(aws ecs describe-services --cluster "${{ steps.params.outputs.cluster }}" \
+                      --services "${{ steps.params.outputs.service }}" \
+                      --query 'services[0].taskDefinition' --output text)
+          if [[ "$RUNNING" != "${{ steps.ecs.outputs.task-definition-arn }}" ]]; then
+            echo "ECS circuit breaker rolled back the deployment (running: $RUNNING)"; exit 1
+          fi
+
+      # 4c. End-to-end validation through the public API
+      - name: Smoke test
+        run: scripts/smoke-test.sh
+
+      # ── Automatic rollback (only runs if something above failed) ──
+      - name: "Rollback: Lambdas & AppSync to previous deployment"
+        if: failure() && steps.sls.outcome != 'skipped' && steps.previous.outputs.sls_timestamp != ''
+        working-directory: backend/lambdas
+        run: |
+          echo "Rolling back Serverless stack to ${{ steps.previous.outputs.sls_timestamp }}"
+          npx serverless rollback --timestamp "${{ steps.previous.outputs.sls_timestamp }}" --stage "$STAGE" --region "$AWS_REGION"
+
+      - name: "Rollback: ECS service to previous task definition"
+        if: failure() && steps.ecs.outcome != 'skipped' && steps.previous.outputs.task_definition != '' && steps.previous.outputs.task_definition != 'None'
+        run: |
+          echo "Rolling back ECS to ${{ steps.previous.outputs.task_definition }}"
+          aws ecs update-service --cluster "${{ steps.params.outputs.cluster }}" \
+            --service "${{ steps.params.outputs.service }}" \
+            --task-definition "${{ steps.previous.outputs.task_definition }}" >/dev/null
+          aws ecs wait services-stable --cluster "${{ steps.params.outputs.cluster }}" \
+            --services "${{ steps.params.outputs.service }}"
+
+  # ───────────────────────────── 5. Frontend ─────────────────────────────
+  deploy-frontend:
+    name: Deploy frontend (S3 + CloudFront)
+    needs: deploy-backend
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Load deployment parameters
+        id: params
+        run: |
+          get() { aws ssm get-parameter --name "$SSM_PREFIX/$1" --query Parameter.Value --output text; }
+          {
+            echo "bucket=$(get frontend-bucket)"
+            echo "artifacts=$(get frontend-artifacts-bucket)"
+            echo "distribution=$(get frontend-distribution-id)"
+            echo "url=$(get frontend-url)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Read AppSync endpoint config (injected at build time)
+        id: appsync
+        run: scripts/appsync-config.sh >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        working-directory: frontend
+        env:
+          VITE_APPSYNC_URL: ${{ steps.appsync.outputs.url }}
+          VITE_APPSYNC_REALTIME_URL: ${{ steps.appsync.outputs.realtime }}
+          VITE_APPSYNC_API_KEY: ${{ steps.appsync.outputs.key }}
+        run: npm ci && npm run build
+
+      - name: Record last known good release
+        id: previous
+        run: |
+          PREV=$(aws s3 cp "s3://${{ steps.params.outputs.artifacts }}/frontend/LAST_GOOD" - 2>/dev/null || true)
+          echo "sha=${PREV}" >> "$GITHUB_OUTPUT"
+          echo "Previous release: ${PREV:-<none>}"
+
+      - name: Archive this release (for future rollbacks)
+        run: aws s3 sync frontend/dist "s3://${{ steps.params.outputs.artifacts }}/frontend/releases/${GITHUB_SHA}/" --delete
+
+      - name: Publish to S3 and invalidate CloudFront
+        id: publish
+        run: scripts/frontend-publish.sh frontend/dist "${{ steps.params.outputs.bucket }}" "${{ steps.params.outputs.distribution }}"
+
+      - name: Smoke test (HTTPS, security headers, assets)
+        run: |
+          URL="${{ steps.params.outputs.url }}"
+          curl -sSf -D headers.txt "$URL/" -o index.html
+          grep -q '<div id="root">' index.html
+          grep -qi '^strict-transport-security:' headers.txt
+          grep -qi '^content-security-policy:' headers.txt
+          ASSET=$(grep -oE '/assets/[^"]+\.js' index.html | head -1)
+          curl -sSf -o /dev/null "$URL$ASSET"
+          echo "Frontend is live at $URL"
+
+      - name: Mark release as last known good
+        run: echo -n "$GITHUB_SHA" | aws s3 cp - "s3://${{ steps.params.outputs.artifacts }}/frontend/LAST_GOOD"
+
+      - name: "Rollback: republish previous release"
+        if: failure() && steps.publish.outcome != 'skipped' && steps.previous.outputs.sha != ''
+        run: |
+          PREV="${{ steps.previous.outputs.sha }}"
+          echo "Rolling back frontend to ${PREV}"
+          aws s3 sync "s3://${{ steps.params.outputs.artifacts }}/frontend/releases/${PREV}/" rollback-dist/
+          scripts/frontend-publish.sh rollback-dist "${{ steps.params.outputs.bucket }}" "${{ steps.params.outputs.distribution }}"

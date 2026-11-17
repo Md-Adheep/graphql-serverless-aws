@@ -1,0 +1,108 @@
+# Continuous Integration: runs on every pull request and every push to a feature branch,
+# and is re-used (workflow_call) as the first stage of the production deploy pipeline.
+# Nothing here needs AWS credentials.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches-ignore: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  NODE_VERSION: '22'
+  TERRAFORM_VERSION: '1.17.2'
+
+jobs:
+  lambdas:
+    name: Lambdas (typecheck, test, bundle)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend/lambdas
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: backend/lambdas/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - name: Bundle every handler (catches import / loader errors before deploy)
+        run: npx esbuild 'src/handlers/*.ts' --bundle --platform=node --target=node22 --loader:.sql=text --outdir=.esbuild-check --log-level=warning
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+  graphql-server:
+    name: GraphQL server (typecheck, test, build, docker)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend/graphql-server
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: backend/graphql-server/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+      - name: Docker build (validates the Dockerfile)
+        run: docker build -t graphql-server:ci .
+
+  frontend:
+    name: Frontend (typecheck, test, build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+  terraform:
+    name: Terraform (fmt, validate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+      - name: terraform fmt
+        run: terraform fmt -check -recursive infrastructure
+      - name: terraform validate (bootstrap)
+        working-directory: infrastructure/bootstrap
+        run: terraform init -backend=false -input=false && terraform validate
+      - name: terraform validate (prod)
+        working-directory: infrastructure/environments/prod
+        run: terraform init -backend=false -input=false && terraform validate
+
+  scripts:
+    name: Shell scripts (shellcheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: shellcheck scripts/*.sh

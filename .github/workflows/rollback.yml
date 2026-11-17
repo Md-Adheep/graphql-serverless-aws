@@ -1,0 +1,91 @@
+# Manual rollback ("break glass"). Automatic rollback already happens inside deploy.yml;
+# this workflow lets an operator restore any earlier version on demand.
+#
+# Leave "target" empty to LIST the available versions for the chosen component.
+name: Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      component:
+        description: What to roll back
+        type: choice
+        options: [lambdas, ecs, frontend]
+        required: true
+      target:
+        description: "lambdas: deployment timestamp | ecs: task definition revision number | frontend: git SHA. Empty = list options."
+        type: string
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-prod # never run at the same time as a deploy
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  STAGE: prod
+  SSM_PREFIX: /graphql-app/prod
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ---------------- Lambdas / AppSync ----------------
+      - name: Lambdas
+        if: inputs.component == 'lambdas'
+        working-directory: backend/lambdas
+        run: |
+          npm ci
+          if [[ -z "${{ inputs.target }}" ]]; then
+            npx serverless deploy list --stage "$STAGE" --region "$AWS_REGION"
+            exit 0
+          fi
+          npx serverless rollback --timestamp "${{ inputs.target }}" --stage "$STAGE" --region "$AWS_REGION"
+
+      # ---------------- ECS ----------------
+      - name: ECS
+        if: inputs.component == 'ecs'
+        run: |
+          get() { aws ssm get-parameter --name "$SSM_PREFIX/$1" --query Parameter.Value --output text; }
+          CLUSTER=$(get ecs-cluster); SERVICE=$(get ecs-service); FAMILY=$(get ecs-task-family)
+          if [[ -z "${{ inputs.target }}" ]]; then
+            echo "Running: $(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --query 'services[0].taskDefinition' --output text)"
+            aws ecs list-task-definitions --family-prefix "$FAMILY" --sort DESC --max-items 10 --output table
+            exit 0
+          fi
+          aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --task-definition "${FAMILY}:${{ inputs.target }}" >/dev/null
+          aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
+          echo "ECS now running ${FAMILY}:${{ inputs.target }}"
+
+      # ---------------- Frontend ----------------
+      - name: Frontend
+        if: inputs.component == 'frontend'
+        run: |
+          get() { aws ssm get-parameter --name "$SSM_PREFIX/$1" --query Parameter.Value --output text; }
+          ARTIFACTS=$(get frontend-artifacts-bucket)
+          if [[ -z "${{ inputs.target }}" ]]; then
+            echo "Last good: $(aws s3 cp "s3://$ARTIFACTS/frontend/LAST_GOOD" - 2>/dev/null || echo none)"
+            aws s3 ls "s3://$ARTIFACTS/frontend/releases/"
+            exit 0
+          fi
+          aws s3 sync "s3://$ARTIFACTS/frontend/releases/${{ inputs.target }}/" rollback-dist/
+          scripts/frontend-publish.sh rollback-dist "$(get frontend-bucket)" "$(get frontend-distribution-id)"
+          echo -n "${{ inputs.target }}" | aws s3 cp - "s3://$ARTIFACTS/frontend/LAST_GOOD"
+
+      - name: Smoke test
+        if: inputs.target != '' && inputs.component != 'frontend'
+        run: scripts/smoke-test.sh

@@ -10,8 +10,8 @@
     "deploy": "serverless deploy --stage ${STAGE:-prod}"
   },
   "dependencies": {
-    "@aws-sdk/client-secrets-manager": "^3.1170.0",
-    "@aws-sdk/rds-signer": "^3.1170.0",
+    "@aws-sdk/client-secrets-manager": "^3.1175.0",
+    "@aws-sdk/rds-signer": "^3.1175.0",
     "pg": "^8.23.1"
   },
   "devDependencies": {
